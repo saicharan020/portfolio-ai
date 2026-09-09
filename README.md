@@ -1,50 +1,91 @@
 # Voice AI Portfolio
 
-Phase 1: Next.js frontend + FastAPI backend + local Ollama LLM, connected end to end. No voice, RAG, embeddings, tool calling, or production deployment yet.
+My personal portfolio with a voice-first AI assistant. Visitors will be able to talk to it naturally and ask about my experience, projects, skills, education, and achievements. The assistant will answer using information from my portfolio and will eventually navigate the website through voice commands.
 
-## Prerequisites
+## Current Status
+
+Phase 1 is complete. The basic system works end to end:
+
+Next.js → FastAPI → Ollama → FastAPI → Next.js
+
+For now, interaction is through text. Voice, RAG, navigation tools, and production deployment will be added in later phases.
+
+## Requirements
 
 - Node.js 20+
 - Python 3.11+
-- [Ollama](https://ollama.com) installed locally, with a model pulled (default expected: `llama3.2`)
+- Ollama
+- Git
+- Ollama llama3.2 model
 
-## Backend (FastAPI)
+## Backend
 
 ```bash
 cd apps/api
 python -m venv .venv
-
-# Windows
 .venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-pip install -r requirements.txt
-cp .env.example .env
+Create `.env` from `.env.example`.
 
-# In a separate terminal, make sure Ollama is running:
+Start Ollama:
+
+```bash
 ollama serve
-ollama pull llama3.2   # if not already pulled
+```
 
+If needed:
+
+```bash
+ollama pull llama3.2
+```
+
+Start FastAPI:
+
+```bash
 uvicorn main:app --reload --port 8000
 ```
 
-Backend runs at http://localhost:8000. Check `GET /health` for a quick sanity check.
+API: [http://localhost:8000](http://localhost:8000)
 
-## Frontend (Next.js)
+Health check: [http://localhost:8000/health](http://localhost:8000/health)
+
+## Frontend
+
+Open another terminal:
 
 ```bash
 cd apps/web
 npm install
-cp .env.example .env.local
 npm run dev
 ```
 
-Frontend runs at http://localhost:3000. Type a message and click Send — it calls the FastAPI backend, which forwards it to Ollama and returns the reply.
+Create `.env.local` from `.env.example`.
 
-## Configuration
+Portfolio: [http://localhost:3000](http://localhost:3000)
 
-- `apps/api/.env` — `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `CORS_ORIGINS`. Swapping to a production provider (e.g. Groq) later is just changing these values.
-- `apps/web/.env.local` — `NEXT_PUBLIC_API_URL` (points the frontend at the backend).
+## Architecture
 
-Both `.env.example` files are committed; actual `.env`/`.env.local` files are gitignored.
+```text
+User
+ ↓
+Next.js Frontend
+ ↓
+FastAPI Backend
+ ↓
+Ollama
+ ↓
+Local LLM
+```
+
+The frontend communicates with FastAPI instead of calling the LLM directly. The backend uses an OpenAI-compatible interface so the LLM provider can be changed later without redesigning the application.
+
+## Future Plans
+
+- Voice interaction using speech-to-text and text-to-speech
+- RAG using verified portfolio content
+- AI tool calling for website navigation
+- Hosted LLM for production
+- Frontend deployment on Vercel
+- Backend deployment on a free-tier hosting service
