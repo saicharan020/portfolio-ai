@@ -11,18 +11,25 @@ class LLMError(Exception):
     pass
 
 
-async def get_chat_completion(message: str) -> str:
-    """Send a single user message to an OpenAI-compatible chat completions
-    endpoint and return the assistant's reply text.
+async def get_chat_completion(message: str, context: str | None = None) -> str:
+    """Send a user message to an OpenAI-compatible chat completions endpoint
+    and return the assistant's reply text.
+
+    If `context` is given, it's sent as a system message ahead of the user
+    message (used to ground replies in retrieved portfolio content).
 
     Swapping LLM providers (Ollama -> Groq, etc.) only requires changing the
     LLM_BASE_URL / LLM_API_KEY / LLM_MODEL environment variables.
     """
     url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    messages = []
+    if context:
+        messages.append({"role": "system", "content": context})
+    messages.append({"role": "user", "content": message})
     payload = {
         "model": LLM_MODEL,
-        "messages": [{"role": "user", "content": message}],
+        "messages": messages,
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
