@@ -1,7 +1,3 @@
-# Certifications (PLACEHOLDER CONTENT)
+# Certifications
 
-This file is placeholder content listing example certifications used
-only to test retrieval. It is not a real list and should be replaced
-later.
-
-Example Cloud Platform — Fictional Associate Certification (2023)
+Certification information has not yet been added to this portfolio.

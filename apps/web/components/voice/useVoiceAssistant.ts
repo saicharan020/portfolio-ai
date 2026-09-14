@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { executeAction } from "@/lib/actions";
 import { sendChatMessage } from "@/lib/apiClient";
 import {
   cancelSpeech,
@@ -66,6 +67,7 @@ export function useVoiceAssistant() {
     try {
       const res = await sendChatMessage(text);
       setMessages((prev) => [...prev, { role: "assistant", text: res.reply }]);
+      executeAction(res.action);
       setStatus("speaking");
       speak(
         res.reply,

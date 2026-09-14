@@ -1,11 +1,5 @@
-# Other Projects (PLACEHOLDER CONTENT)
+# Other Projects
 
-This file is placeholder content describing fictional non-AI projects,
-used only to test the RAG pipeline. Replace it with real project
-details later.
-
-Example Budget Tracker
-A fictional personal finance web app for tracking fictional expenses.
-
-Sample Recipe Site
-A fictional website for browsing and saving fictional recipes.
+Additional project information has not yet been added to this portfolio.
+The AI/ML projects currently documented are covered in the AI Projects
+section.

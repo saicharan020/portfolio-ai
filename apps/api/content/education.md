@@ -1,8 +1,6 @@
-# Education (PLACEHOLDER CONTENT)
+# Education
 
-This file is placeholder content describing a fictional education
-history, used only to test retrieval. Replace it with real education
-details later.
+## Master of Science in Computer & Information Science
 
-Example University — B.S. in a fictional field of Computer Science
-(2016-2020).
+Concordia University Wisconsin
+March 2024 – May 2025

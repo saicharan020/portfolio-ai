@@ -67,12 +67,15 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
-async def retrieve(query: str, k: int = 3) -> list[Chunk]:
-    """Return the top-k most relevant chunks for a query.
+async def retrieve_scored(query: str, k: int = 3) -> list[tuple[Chunk, float]]:
+    """Return the top-k most relevant chunks for a query, each paired with
+    its cosine similarity score (highest first).
 
     Returns an empty list if the index hasn't been built or the query
     embedding call fails, so callers can fall back to an ungrounded reply
-    instead of erroring out.
+    instead of erroring out. The score is exposed (rather than just the
+    chunks) so callers can make a confidence-gated decision — e.g. whether
+    a question is relevant enough to a portfolio section to navigate there.
     """
     if not _index:
         return []
@@ -84,4 +87,9 @@ async def retrieve(query: str, k: int = 3) -> list[Chunk]:
 
     scored = [(chunk, _cosine_similarity(query_vector, chunk.vector)) for chunk in _index]
     scored.sort(key=lambda pair: pair[1], reverse=True)
-    return [chunk for chunk, _ in scored[:k]]
+    return scored[:k]
+
+
+async def retrieve(query: str, k: int = 3) -> list[Chunk]:
+    """Return the top-k most relevant chunks for a query (no scores)."""
+    return [chunk for chunk, _ in await retrieve_scored(query, k)]

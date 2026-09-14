@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -6,17 +7,81 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from core.actions import NAVIGATE_TOOL_NAME, TOOL_SCHEMA, NavigateAction, validate_action
 from core.llm_client import LLMError, get_chat_completion
-from core.rag import Chunk, build_index, retrieve
+from core.rag import Chunk, build_index, retrieve, retrieve_scored
 
 load_dotenv()
 
+# Minimum cosine similarity between the user's message and a portfolio
+# content chunk before we treat the question as "clearly about" that
+# section and navigate to it. Tunable via env var without a code change —
+# the right value depends on the embedding model and content in use.
+#
+# Calibrated against nomic-embed-text over the real Phase 5 content: with
+# short, single-chunk-per-file documents, on-topic and off-topic scores
+# overlap (e.g. "Explain Python dictionaries" scored 0.537, higher than
+# several genuinely on-topic queries). 0.55 was chosen to keep clearly
+# off-topic/general-knowledge questions (which must never navigate) below
+# the bar, at the cost of missing navigation for a few softer knowledge
+# questions whose top score falls just under it. Explicit commands
+# ("take me to experience") aren't affected by this threshold — they're
+# handled by the LLM's own tool call, validated the same way, independent
+# of this fallback path.
+NAV_SIMILARITY_THRESHOLD = float(os.getenv("NAV_SIMILARITY_THRESHOLD", "0.55"))
+
+# Minimum cosine similarity a tool call's OWN claimed target must reach
+# against the RAG index before it's trusted, when that target is a
+# RAG-backed section. This is a lower bar than NAV_SIMILARITY_THRESHOLD -
+# it exists only to catch clearly implausible tool calls (e.g. the model
+# spontaneously calling navigate_to_section for an unrelated general
+# knowledge question), not to gate legitimate explicit commands, which can
+# have modest scores. Sections with no RAG content (home, github) have
+# nothing to check against, so their tool calls are always trusted -
+# explicit commands for those keep working regardless of this floor.
+#
+# This can't fully prevent a small local model from hallucinating a
+# plausible-looking-but-wrong tool call (e.g. it may still pick a section
+# whose content happens to share vocabulary with an unrelated question -
+# "Python" appears in both a general-knowledge question and this
+# portfolio's Skills/Experience content), but it does catch the more
+# obviously spurious cases.
+TOOL_CALL_CONFIRMATION_FLOOR = float(os.getenv("TOOL_CALL_CONFIRMATION_FLOOR", "0.4"))
+
+# Large enough to cover the whole content index (currently 9 files), so the
+# tool-call confirmation check above can look up any claimed target's own
+# score. retrieve_scored already computes similarity against every chunk
+# internally - this only changes how much of that already-computed, sorted
+# list is returned, not what's retrieved or how. Context building below
+# still only uses the top 3, unchanged from before.
+_RAG_FULL_INDEX_K = 20
+
 SYSTEM_PROMPT_PREFIX = (
-    "You are an assistant answering questions about a portfolio, using only "
-    "the portfolio information below. If the answer isn't in this "
-    "information, say you don't have that information rather than "
-    "guessing.\n\n"
+    "You are Charan, answering questions about your own background as "
+    "yourself, in first person, the way you would in an interview. Use "
+    "only the portfolio information below as your factual source. "
+    "Paraphrase it into natural, spoken sentences - do not quote it, "
+    "list it, or use Markdown formatting. Usually 2-3 sentences is "
+    "enough. If the information below does not cover the question, say "
+    "you do not have that information in your portfolio rather than "
+    "guessing. Questions unrelated to your background should be "
+    "answered normally, as general knowledge.\n\n"
+    "Portfolio information:\n"
 )
+
+_NO_PORTFOLIO_INFO_REPLY = "I don't have that information in my portfolio."
+
+# Substrings that only show up when a model has leaked tool-call-shaped
+# text into its answer instead of (or alongside) real prose - including
+# malformed/multi-fragment JSON soup that _find_json_object can't cleanly
+# parse. Content matching this is never shown to the user, even partially.
+_LEAKED_CALL_MARKERS = ('"name"', '"parameters"', '"arguments"', "navigate_to_section", "navigate\\_to\\_section")
+
+_HEADING_RE = re.compile(r"(?m)^#{1,6}\s*")
+_BULLET_RE = re.compile(r"(?m)^\s*[-*+]\s+")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_ITALIC_RE = re.compile(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])")
+_CODE_RE = re.compile(r"`([^`]*)`")
 
 
 def _build_context(chunks: list[Chunk]) -> str:
@@ -24,6 +89,39 @@ def _build_context(chunks: list[Chunk]) -> str:
         return ""
     sections = "\n\n".join(f"## {c.title}\n{c.text}" for c in chunks)
     return SYSTEM_PROMPT_PREFIX + sections
+
+
+def _strip_markdown(text: str) -> str:
+    """Strip Markdown syntax (headings, bullet markers, emphasis, code
+    spans) from a reply so raw document formatting never reaches the user.
+
+    This is a deterministic safety net on top of the system prompt's
+    plain-prose instruction: the model is told not to use Markdown, but a
+    small local model can still slip up, so this guarantees it regardless.
+    """
+    if not text:
+        return text
+
+    text = _HEADING_RE.sub("", text)
+    text = _BULLET_RE.sub("", text)
+    text = _BOLD_RE.sub(lambda m: m.group(1) or m.group(2), text)
+    text = _ITALIC_RE.sub(r"\1", text)
+    text = _CODE_RE.sub(r"\1", text)
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return re.sub(r"\s{2,}", " ", " ".join(lines)).strip()
+
+
+def _looks_like_leaked_tool_call(text: str) -> bool:
+    """Detect tool-call-shaped text that survived cleanup - including
+    malformed/multi-fragment JSON soup that isn't one clean parseable
+    object, so _find_json_object in llm_client can't catch it. Natural
+    prose about a portfolio essentially never contains a brace alongside
+    one of these exact quoted JSON key names, so this is a safe check.
+    """
+    if "{" not in text and "}" not in text:
+        return False
+    return any(marker in text for marker in _LEAKED_CALL_MARKERS)
 
 
 @asynccontextmanager
@@ -50,6 +148,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+    action: NavigateAction | None = None
 
 
 class RetrievedChunk(BaseModel):
@@ -73,15 +172,60 @@ async def chat(request: ChatRequest) -> ChatResponse:
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message must not be empty")
 
-    chunks = await retrieve(request.message)
+    scored_chunks = await retrieve_scored(request.message, k=_RAG_FULL_INDEX_K)
+    chunks = [chunk for chunk, _score in scored_chunks[:3]]
     context = _build_context(chunks)
 
     try:
-        reply = await get_chat_completion(request.message, context=context or None)
+        result = await get_chat_completion(
+            request.message, context=context or None, tools=[TOOL_SCHEMA]
+        )
     except LLMError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return ChatResponse(reply=reply)
+    # An explicit, well-formed tool call (real or recovered from a leaked
+    # JSON blob) takes precedence — but only if RAG doesn't clearly
+    # contradict it (see TOOL_CALL_CONFIRMATION_FLOOR above). Otherwise,
+    # fall back to whichever portfolio section the question is most
+    # semantically about — this is what makes an ordinary knowledge
+    # question ("tell me about your experience") navigate too, not just an
+    # explicit command ("show me...").
+    action = validate_action(result.tool_call)
+    if action is not None:
+        target_score = next(
+            (score for chunk, score in scored_chunks if chunk.id == action.target), None
+        )
+        if target_score is not None and target_score < TOOL_CALL_CONFIRMATION_FLOOR:
+            action = None
+
+    if action is None and scored_chunks:
+        top_chunk, top_score = scored_chunks[0]
+        if top_score >= NAV_SIMILARITY_THRESHOLD:
+            action = validate_action(
+                {"name": NAVIGATE_TOOL_NAME, "arguments": {"target": top_chunk.id}}
+            )
+
+    reply_text = result.content.strip()
+    if not reply_text or _looks_like_leaked_tool_call(reply_text):
+        # The first call (offered the navigation tool) sometimes produces no
+        # usable prose at all, or leaks tool-call-shaped/malformed JSON text
+        # instead of an answer - small local models do this more than
+        # larger ones. Retry once without tools, purely to generate natural
+        # language; the navigation decision above already happened and is
+        # untouched by this retry (it never runs again).
+        try:
+            retry = await get_chat_completion(request.message, context=context or None)
+            candidate = retry.content.strip()
+            reply_text = candidate if candidate and not _looks_like_leaked_tool_call(candidate) else ""
+        except LLMError:
+            reply_text = ""
+
+    if not reply_text:
+        # Never fall back to showing the raw retrieved Markdown - if there's
+        # still no natural-language answer, say so plainly instead.
+        reply_text = _NO_PORTFOLIO_INFO_REPLY
+
+    return ChatResponse(reply=_strip_markdown(reply_text), action=action)
 
 
 @app.get("/api/retrieve", response_model=RetrieveResponse)
