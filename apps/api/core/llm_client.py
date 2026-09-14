@@ -9,9 +9,49 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
 
+# Ollama ignores auth entirely, so "ollama" is a valid dummy key for local
+# dev - but it's never a valid key for a real hosted provider like Groq, so
+# it doubles as a sign that LLM_BASE_URL was switched to production without
+# also setting a real LLM_API_KEY.
+_OLLAMA_DEFAULT_KEY = "ollama"
+_PLACEHOLDER_KEY_MARKERS = ("your-groq-api-key", "your_groq_api_key", "changeme", "replace-me")
+
 
 class LLMError(Exception):
     pass
+
+
+class LLMConfigError(LLMError):
+    """The configured LLM provider is missing required setup (e.g. no API
+    key, or an unset/placeholder key for a hosted provider). Raised before
+    any network call so misconfiguration is reported clearly instead of as
+    a generic connection or auth failure.
+    """
+
+
+def _is_hosted_provider(base_url: str) -> bool:
+    return "localhost" not in base_url and "127.0.0.1" not in base_url
+
+
+def _ensure_configured() -> None:
+    key = LLM_API_KEY.strip()
+    if not key:
+        raise LLMConfigError(
+            "LLM_API_KEY is not set. Add it to apps/api/.env "
+            "(LLM_API_KEY=ollama for local Ollama, or a real API key for a "
+            "hosted provider like Groq)."
+        )
+
+    if _is_hosted_provider(LLM_BASE_URL):
+        key_lower = key.lower()
+        if key_lower == _OLLAMA_DEFAULT_KEY or any(
+            marker in key_lower for marker in _PLACEHOLDER_KEY_MARKERS
+        ):
+            raise LLMConfigError(
+                f"LLM_BASE_URL ({LLM_BASE_URL}) points at a hosted provider, "
+                "but LLM_API_KEY is still the local Ollama default or an "
+                "unfilled placeholder. Set a real API key in apps/api/.env."
+            )
 
 
 @dataclass
@@ -103,12 +143,21 @@ async def get_chat_completion(
     message: str,
     context: str | None = None,
     tools: list[dict[str, Any]] | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> LLMResponse:
     """Send a user message to an OpenAI-compatible chat completions endpoint
     and return the assistant's reply text plus any tool call it made.
 
     If `context` is given, it's sent as a system message ahead of the user
     message (used to ground replies in retrieved portfolio content).
+
+    If `history` is given, each turn (already validated/sanitized by the
+    caller as {"role": "user"|"assistant", "text": str}) is sent as its own
+    message, oldest first, between the system context and the new user
+    message - this is what lets the model resolve a follow-up like "In
+    which year?" using the immediately preceding exchange. Callers are
+    responsible for sanitizing and bounding history before it reaches here;
+    this function trusts the shape it's given.
 
     If `tools` is given, it's passed through as the OpenAI-compatible `tools`
     parameter, letting the model optionally request one of them. The caller
@@ -118,11 +167,15 @@ async def get_chat_completion(
     Swapping LLM providers (Ollama -> Groq, etc.) only requires changing the
     LLM_BASE_URL / LLM_API_KEY / LLM_MODEL environment variables.
     """
+    _ensure_configured()
+
     url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
     messages = []
     if context:
         messages.append({"role": "system", "content": context})
+    if history:
+        messages.extend({"role": turn["role"], "content": turn["text"]} for turn in history)
     messages.append({"role": "user", "content": message})
     payload: dict[str, Any] = {
         "model": LLM_MODEL,
@@ -135,6 +188,14 @@ async def get_chat_completion(
         try:
             response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                raise LLMConfigError(
+                    f"LLM provider rejected the request ({exc.response.status_code} "
+                    f"from {LLM_BASE_URL}). Check that LLM_API_KEY in apps/api/.env "
+                    "is a valid, current key for the configured provider."
+                ) from exc
+            raise LLMError(f"LLM request failed: {exc}") from exc
         except httpx.HTTPError as exc:
             raise LLMError(f"LLM request failed: {exc}") from exc
 

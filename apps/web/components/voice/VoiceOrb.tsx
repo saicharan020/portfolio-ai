@@ -11,9 +11,9 @@ interface VoiceOrbProps {
 
 const STATUS_LABEL: Record<VoiceStatus, string> = {
   idle: "Tap to speak",
-  listening: "Listening… tap to stop",
-  thinking: "Thinking…",
-  speaking: "Speaking…",
+  listening: "Listening… tap to end conversation",
+  thinking: "Thinking… tap to end conversation",
+  speaking: "Speaking… tap to end conversation",
   error: "Tap to try again",
 };
 
@@ -26,12 +26,13 @@ const STATUS_COLOR: Record<VoiceStatus, string> = {
 };
 
 export function VoiceOrb({ status, supported, onStart, onStop }: VoiceOrbProps) {
-  const busy = status === "thinking" || status === "speaking";
-  const listening = status === "listening";
+  // Once a conversation has started, tapping again at any phase (listening,
+  // thinking, or speaking) ends it - only "idle"/"error" start a new one.
+  const active = status === "listening" || status === "thinking" || status === "speaking";
 
   function handleClick() {
-    if (!supported || busy) return;
-    if (listening) {
+    if (!supported) return;
+    if (active) {
       onStop();
     } else {
       onStart();
@@ -43,11 +44,11 @@ export function VoiceOrb({ status, supported, onStart, onStop }: VoiceOrbProps) 
       <button
         type="button"
         onClick={handleClick}
-        disabled={!supported || busy}
-        aria-pressed={listening}
+        disabled={!supported}
+        aria-pressed={active}
         aria-label={supported ? STATUS_LABEL[status] : "Voice input unavailable in this browser"}
         className={`h-24 w-24 rounded-full text-white shadow-md transition-transform disabled:cursor-not-allowed disabled:opacity-60 ${STATUS_COLOR[status]} ${
-          listening ? "scale-110" : "scale-100"
+          active ? "scale-110" : "scale-100"
         }`}
       />
       <p className="text-sm text-zinc-600 dark:text-zinc-400" aria-hidden="true">

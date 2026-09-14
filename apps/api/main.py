@@ -1,8 +1,16 @@
 import os
 import re
 from contextlib import asynccontextmanager
+from typing import Any
 
 from dotenv import load_dotenv
+
+# Must run before importing core.* modules below: several of them read
+# provider config (LLM_BASE_URL, LLM_API_KEY, EMBEDDING_BASE_URL, ...) into
+# module-level constants at import time, so .env has to be loaded first or
+# those values silently fall back to hardcoded defaults.
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,8 +18,6 @@ from pydantic import BaseModel
 from core.actions import NAVIGATE_TOOL_NAME, TOOL_SCHEMA, NavigateAction, validate_action
 from core.llm_client import LLMError, get_chat_completion
 from core.rag import Chunk, build_index, retrieve, retrieve_scored
-
-load_dotenv()
 
 # Minimum cosine similarity between the user's message and a portfolio
 # content chunk before we treat the question as "clearly about" that
@@ -70,6 +76,80 @@ SYSTEM_PROMPT_PREFIX = (
 )
 
 _NO_PORTFOLIO_INFO_REPLY = "I don't have that information in my portfolio."
+
+# Conversation history is untrusted client input (Phase 6: conversational
+# context) - bounded to the same "last 6-10 messages" the frontend is
+# expected to send, so a misbehaving/stale client can't force an
+# ever-growing prompt. Applied after sanitization, oldest-first, so the LLM
+# always sees a fixed-size, chronologically-ordered window.
+_MAX_HISTORY_TURNS = 8
+
+# How many of the user's own recent turns (never the assistant's, see
+# _build_retrieval_query) get folded into the RAG search query so a short,
+# context-dependent follow-up can still retrieve the right section. Smaller
+# than _MAX_HISTORY_TURNS on purpose: the LLM benefits from the fuller
+# conversational memory, but the retrieval query should stay focused on
+# what was JUST being discussed, not topics from several turns ago.
+_RETRIEVAL_HISTORY_USER_TURNS = 2
+
+
+def _sanitize_history(raw: Any) -> list[dict[str, str]]:
+    """Defensively validate client-supplied conversation history.
+
+    This is untrusted input from the browser, so nothing here is trusted by
+    shape: anything that isn't a well-formed {"role": "user"|"assistant",
+    "text": <non-empty str>} turn is silently dropped rather than rejected -
+    one malformed entry (e.g. from a stale frontend build) must not break
+    the whole request, matching how core.llm_client already treats
+    malformed model output as "tolerant, drop and continue" rather than a
+    hard error. Returns at most the most recent _MAX_HISTORY_TURNS turns,
+    oldest first.
+    """
+    if not isinstance(raw, list):
+        return []
+
+    sanitized: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        text = item.get("text")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        sanitized.append({"role": role, "text": text})
+
+    return sanitized[-_MAX_HISTORY_TURNS:]
+
+
+def _build_retrieval_query(message: str, history: list[dict[str, str]]) -> str:
+    """Fold the user's own recent wording into the RAG search query so a
+    short, context-dependent follow-up ("In which year?", "What about
+    Chase?", "How long did you work there?") can still retrieve the right
+    portfolio section, instead of searching on a near-empty/pronoun-only
+    string that matches nothing.
+
+    Deliberately uses only USER turns, never the assistant's prior reply:
+    an assistant reply already contains near-verbatim RAG chunk text, and
+    mixing that in would bias retrieval toward whatever topic was just
+    discussed even for a genuinely new, unrelated question (e.g. general
+    knowledge asked right after a portfolio question) - the same failure
+    mode NAV_SIMILARITY_THRESHOLD's calibration note guards against, just
+    from the history side instead of the query side.
+
+    With no history (or no prior user turns), this returns `message`
+    unchanged, so a request with no history behaves exactly as it did
+    before conversation history existed.
+    """
+    recent_user_turns = [turn["text"] for turn in history if turn["role"] == "user"]
+    recent_user_turns = recent_user_turns[-_RETRIEVAL_HISTORY_USER_TURNS:]
+    if not recent_user_turns:
+        return message
+    return "\n".join([*recent_user_turns, message])
 
 # Substrings that only show up when a model has leaked tool-call-shaped
 # text into its answer instead of (or alongside) real prose - including
@@ -144,6 +224,10 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+    # Intentionally untyped/unvalidated by pydantic (Any, not
+    # list[ChatTurn]): malformed history must never 422 the whole request -
+    # see _sanitize_history, which does the real, defensive validation.
+    history: Any = None
 
 
 class ChatResponse(BaseModel):
@@ -172,13 +256,16 @@ async def chat(request: ChatRequest) -> ChatResponse:
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message must not be empty")
 
-    scored_chunks = await retrieve_scored(request.message, k=_RAG_FULL_INDEX_K)
+    history = _sanitize_history(request.history)
+
+    retrieval_query = _build_retrieval_query(request.message, history)
+    scored_chunks = await retrieve_scored(retrieval_query, k=_RAG_FULL_INDEX_K)
     chunks = [chunk for chunk, _score in scored_chunks[:3]]
     context = _build_context(chunks)
 
     try:
         result = await get_chat_completion(
-            request.message, context=context or None, tools=[TOOL_SCHEMA]
+            request.message, context=context or None, tools=[TOOL_SCHEMA], history=history
         )
     except LLMError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -214,7 +301,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
         # language; the navigation decision above already happened and is
         # untouched by this retry (it never runs again).
         try:
-            retry = await get_chat_completion(request.message, context=context or None)
+            retry = await get_chat_completion(
+                request.message, context=context or None, history=history
+            )
             candidate = retry.content.strip()
             reply_text = candidate if candidate and not _looks_like_leaked_tool_call(candidate) else ""
         except LLMError:

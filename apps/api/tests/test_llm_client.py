@@ -3,15 +3,22 @@ import json
 import httpx
 import pytest
 
-from core.llm_client import get_chat_completion
+from core import llm_client
+from core.llm_client import LLMConfigError, get_chat_completion
 
 
-def _mock_client(monkeypatch, message_data: dict):
+def _mock_client(monkeypatch, message_data: dict, captured_payloads: list[dict] | None = None):
     """Patch httpx.AsyncClient.post to return a canned OpenAI-shaped
     chat-completion response, without hitting the network.
+
+    If `captured_payloads` is given, every outgoing request body is recorded
+    into it (in order), so a test can assert on the exact `messages` array
+    sent to the provider.
     """
 
     async def fake_post(self, url, json=None, headers=None):
+        if captured_payloads is not None:
+            captured_payloads.append(json)
         request = httpx.Request("POST", url)
         return httpx.Response(
             200,
@@ -111,6 +118,123 @@ async def test_stray_brace_before_leaked_json_is_still_stripped(monkeypatch):
         "name": "print",
         "arguments": {"value": "Python dictionaries are unordered collections."},
     }
+
+
+async def test_empty_api_key_is_rejected_before_any_network_call(monkeypatch):
+    monkeypatch.setattr(llm_client, "LLM_API_KEY", "")
+
+    async def _fail_if_called(self, url, json=None, headers=None):
+        raise AssertionError("should not make a network call with no API key")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fail_if_called)
+
+    with pytest.raises(LLMConfigError):
+        await get_chat_completion("hi")
+
+
+async def test_hosted_provider_with_leftover_ollama_key_is_rejected(monkeypatch):
+    monkeypatch.setattr(llm_client, "LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setattr(llm_client, "LLM_API_KEY", "ollama")
+
+    with pytest.raises(LLMConfigError):
+        await get_chat_completion("hi")
+
+
+async def test_hosted_provider_with_unfilled_placeholder_key_is_rejected(monkeypatch):
+    monkeypatch.setattr(llm_client, "LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setattr(llm_client, "LLM_API_KEY", "your-groq-api-key-here")
+
+    with pytest.raises(LLMConfigError):
+        await get_chat_completion("hi")
+
+
+async def test_local_provider_with_ollama_default_key_is_accepted(monkeypatch):
+    # "ollama" is only rejected for a hosted (non-localhost) base URL.
+    monkeypatch.setattr(llm_client, "LLM_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setattr(llm_client, "LLM_API_KEY", "ollama")
+    _mock_client(monkeypatch, {"content": "hi there", "tool_calls": None})
+
+    result = await get_chat_completion("hi")
+
+    assert result.content == "hi there"
+
+
+async def test_hosted_provider_with_real_looking_key_is_accepted(monkeypatch):
+    monkeypatch.setattr(llm_client, "LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setattr(llm_client, "LLM_API_KEY", "gsk_realkeylookingvalue")
+    _mock_client(monkeypatch, {"content": "hi there", "tool_calls": None})
+
+    result = await get_chat_completion("hi")
+
+    assert result.content == "hi there"
+
+
+async def test_401_from_provider_raises_clear_config_error(monkeypatch):
+    monkeypatch.setattr(llm_client, "LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setattr(llm_client, "LLM_API_KEY", "gsk_invalidkey")
+
+    async def fake_post(self, url, json=None, headers=None):
+        request = httpx.Request("POST", url)
+        return httpx.Response(401, request=request, json={"error": {"message": "Invalid API Key"}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    with pytest.raises(LLMConfigError):
+        await get_chat_completion("hi")
+
+
+async def test_no_history_sends_only_the_user_message(monkeypatch):
+    payloads: list[dict] = []
+    _mock_client(monkeypatch, {"content": "hi there", "tool_calls": None}, payloads)
+
+    await get_chat_completion("hello")
+
+    assert payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+async def test_history_is_sent_between_context_and_the_new_message_in_order(monkeypatch):
+    payloads: list[dict] = []
+    _mock_client(monkeypatch, {"content": "I completed it in May 2025.", "tool_calls": None}, payloads)
+    history = [
+        {"role": "user", "text": "What is your education?"},
+        {
+            "role": "assistant",
+            "text": "I earned my Master's from Concordia University Wisconsin.",
+        },
+    ]
+
+    await get_chat_completion(
+        "In which year?", context="Portfolio information:\n## Education\n...", history=history
+    )
+
+    assert payloads[0]["messages"] == [
+        {"role": "system", "content": "Portfolio information:\n## Education\n..."},
+        {"role": "user", "content": "What is your education?"},
+        {"role": "assistant", "content": "I earned my Master's from Concordia University Wisconsin."},
+        {"role": "user", "content": "In which year?"},
+    ]
+
+
+async def test_history_without_context_still_precedes_the_new_message(monkeypatch):
+    payloads: list[dict] = []
+    _mock_client(monkeypatch, {"content": "ok", "tool_calls": None}, payloads)
+    history = [{"role": "user", "text": "earlier turn"}]
+
+    await get_chat_completion("latest message", history=history)
+
+    assert payloads[0]["messages"] == [
+        {"role": "user", "content": "earlier turn"},
+        {"role": "user", "content": "latest message"},
+    ]
+
+
+async def test_empty_history_list_is_equivalent_to_no_history(monkeypatch):
+    payloads: list[dict] = []
+    _mock_client(monkeypatch, {"content": "hi there", "tool_calls": None}, payloads)
+
+    await get_chat_completion("hello", history=[])
+
+    assert payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
 
 
 async def test_real_tool_call_wins_over_separately_leaked_junk_in_content(monkeypatch):
